@@ -1,0 +1,120 @@
+blueprint:
+  name: 房间窗户检查与窗帘纱帘联动（支持多窗户与时长显示）
+  description: >
+    支持定时两次检查（默认 18:00 和 20:00）。
+    支持单选或多选窗户门磁。任意窗户未关即发送通知并显示已开时长；
+    第 2 次检查时若所有窗户均已关闭，延时指定秒数自动合上窗帘/纱帘。
+  domain: automation
+  # 上传后可将下方链接替换为您实际的 GitHub 文件 Raw/Blob 链接，便于 HA 检测更新
+  # source_url: https://github.com/mylofsh/ha-blueprints/blob/main/blueprints/automation/mylofsh/room_window_cover_sync.yaml
+  input:
+    window_sensors:
+      name: 窗户门磁实体
+      description: 该房间对应的窗户传感器（可多选）
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - window
+            - door
+            - opening
+          multiple: true
+    covers_to_close:
+      name: 窗帘与纱帘实体
+      description: 窗户关闭后需要拉上的窗帘、纱帘实体（可多选）
+      selector:
+        target:
+          entity:
+            domain: cover
+    first_check_time:
+      name: 第一次检查时间（仅提醒）
+      description: 仅检查并提醒未关窗，不执行关帘
+      default: "18:00:00"
+      selector:
+        time:
+    second_check_time:
+      name: 第二次检查时间（关帘检查）
+      description: 检查窗户，确认全关后延时关帘；未关则告警
+      default: "20:00:00"
+      selector:
+        time:
+    delay_seconds:
+      name: 确认关窗后延时时间（秒）
+      description: 第二次检查确认窗户全关后，等待多少秒再关窗帘
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: 秒
+          mode: box
+    notify_targets:
+      name: 推送通知服务
+      description: 接收提醒的通知动作（例如 notify.mobile_app_iphone_3）
+      selector:
+        action:
+
+mode: single
+
+trigger:
+  - trigger: time
+    at: !input first_check_time
+    id: check_1
+  - trigger: time
+    at: !input second_check_time
+    id: check_2
+
+variables:
+  raw_windows: !input window_sensors
+  # 筛选处于 'on' 状态的窗户实体
+  open_entities: >
+    {{ expand(raw_windows) | selectattr('state', 'eq', 'on') | list }}
+  has_open: >
+    {{ open_entities | length > 0 }}
+  # 计算未关窗户已打开的时长
+  open_details: >
+    {% set ns = namespace(items=[]) %}
+    {% for ent in open_entities %}
+    {% set duration_sec = (as_timestamp(now()) - as_timestamp(ent.last_changed)) | int %}
+    {% set hours = (duration_sec // 3600) %}
+    {% set minutes = ((duration_sec % 3600) // 60) %}
+    {% if hours > 0 %}
+    {% set time_str = hours ~ "小时" ~ minutes ~ "分钟" %}
+    {% elif minutes > 0 %}
+    {% set time_str = minutes ~ "分钟" %}
+    {% else %}
+    {% set time_str = "刚刚" %}
+    {% endif %}
+    {% set ns.items = ns.items + [ ent.name ~ "（已开 " ~ time_str ~ "）" ] %}
+    {% endfor %}
+    {{ ns.items | join('\n- ') }}
+
+action:
+  - choose:
+      # ================= 分支 1：存在未关闭的窗户 =================
+      - conditions:
+          - condition: template
+            value_template: "{{ has_open }}"
+        sequence:
+          - action: !input notify_targets
+            data:
+              title: "⚠️ 窗户未关闭提醒 ({{ '18:00' if trigger.id == 'check_1' else '20:00' }})"
+              message: |
+                检测到以下窗户未关闭：
+                - {{ open_details }}
+                {% if trigger.id == 'check_2' %}（对应窗帘已取消自动关闭）{% endif %}
+      # ================= 分支 2：所有窗户已闭合，且为第 2 次触发 =================
+      - conditions:
+          - condition: template
+            value_template: "{{ not has_open and trigger.id == 'check_2' }}"
+        sequence:
+          - delay:
+              seconds: !input delay_seconds
+          - action: cover.close_cover
+            target: !input covers_to_close
+          - action: !input notify_targets
+            data:
+              title: 窗帘自动闭合
+              message: "所有窗户已确认关闭，窗帘与纱帘已闭合 ✅"
+    # 默认分支：第 1 次检查若窗户均已关，保持静默
+    default: []
