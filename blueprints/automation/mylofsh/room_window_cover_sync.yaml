@@ -4,9 +4,9 @@ blueprint:
     支持定时两次检查（默认 18:00 和 20:00）。
     支持单选或多选窗户门磁。任意窗户未关即发送通知并显示已开时长；
     第 2 次检查时若所有窗户均已关闭，延时指定秒数自动合上窗帘/纱帘。
+    第 2 次检查仍未关窗时会发送加强提醒。
   domain: automation
-  # 上传后可将下方链接替换为您实际的 GitHub 文件 Raw/Blob 链接，便于 HA 检测更新
-  # source_url: https://github.com/mylofsh/ha-blueprints/blob/main/blueprints/automation/mylofsh/room_window_cover_sync.yaml
+  source_url: https://github.com/mylofsh/ha-blueprints/blob/main/blueprints/automation/mylofsh/room_window_cover_sync.yaml
   input:
     window_sensors:
       name: 窗户门磁实体
@@ -48,6 +48,14 @@ blueprint:
           max: 300
           unit_of_measurement: 秒
           mode: box
+    skip_second_notify:
+      name: 已提醒过则第 2 次不再提醒
+      description: >
+        开启后，如果第 1 次检查已经提醒过（窗户仍开着），第 2 次检查不再重复提醒。
+        关闭则以加强提醒方式再次通知。
+      default: false
+      selector:
+        boolean:
     notify_targets:
       name: 推送通知服务
       description: 接收提醒的通知动作（例如 notify.mobile_app_iphone_3）
@@ -66,44 +74,89 @@ trigger:
 
 variables:
   raw_windows: !input window_sensors
+  st_skip: !input skip_second_notify
+
+  first_check_time_str: !input first_check_time
+  second_check_time_str: !input second_check_time
+
   # 筛选处于 'on' 状态的窗户实体
   open_entities: >
     {{ expand(raw_windows) | selectattr('state', 'eq', 'on') | list }}
   has_open: >
     {{ open_entities | length > 0 }}
+
+  # 本次是第几次检查（用于通知文案）
+  check_label: >
+    {{ '第 1 次检查' if trigger.id == 'check_1' else '第 2 次检查' }}
+
+  # 本次检查的实际配置时间（HH:MM），不写死；先 trim 去掉折叠标量带的换行\n再取前 5 位
+  check_time_str: >
+    {{ ((first_check_time_str if trigger.id == 'check_1' else second_check_time_str) | string | trim)[0:5] }}
+
   # 计算未关窗户已打开的时长
-  open_details: >
-    {% set ns = namespace(items=[]) %}
-    {% for ent in open_entities %}
-    {% set duration_sec = (as_timestamp(now()) - as_timestamp(ent.last_changed)) | int %}
-    {% set hours = (duration_sec // 3600) %}
-    {% set minutes = ((duration_sec % 3600) // 60) %}
-    {% if hours > 0 %}
-    {% set time_str = hours ~ "小时" ~ minutes ~ "分钟" %}
-    {% elif minutes > 0 %}
-    {% set time_str = minutes ~ "分钟" %}
-    {% else %}
-    {% set time_str = "刚刚" %}
-    {% endif %}
-    {% set ns.items = ns.items + [ ent.name ~ "（已开 " ~ time_str ~ "）" ] %}
-    {% endfor %}
-    {{ ns.items | join('\n- ') }}
+  # 注意：用 {%- -%} 去掉每行首尾空白，否则每行控制语句都会留下空行
+  # 输出不带 "- " 前缀，前缀由调用方的消息模板统一添加
+  open_details: |
+    {%- set ns = namespace(items=[]) -%}
+    {%- for ent in open_entities -%}
+    {%- set duration_sec = (as_timestamp(now()) - as_timestamp(ent.last_changed)) | int -%}
+    {%- set hours = (duration_sec // 3600) -%}
+    {%- set minutes = ((duration_sec % 3600) // 60) -%}
+    {%- if hours > 0 and minutes > 0 -%}
+    {%- set time_str = hours ~ " 小时 " ~ minutes ~ " 分钟" -%}
+    {%- elif hours > 0 -%}
+    {%- set time_str = hours ~ " 小时" -%}
+    {%- elif minutes > 0 -%}
+    {%- set time_str = minutes ~ " 分钟" -%}
+    {%- else -%}
+    {%- set time_str = "不到 1 分钟" -%}
+    {%- endif -%}
+    {%- set ns.items = ns.items + [ ent.name ~ "（已开 " ~ time_str ~ "）" ] -%}
+    {%- endfor -%}
+    {{ ns.items | join('\n') }}
 
 action:
   - choose:
-      # ================= 分支 1：存在未关闭的窗户 =================
+      # ================= 分支 1：第 1 次检查，存在未关闭的窗户 =================
       - conditions:
           - condition: template
-            value_template: "{{ has_open }}"
+            value_template: "{{ has_open and trigger.id == 'check_1' }}"
         sequence:
           - action: !input notify_targets
             data:
-              title: "⚠️ 窗户未关闭提醒 ({{ '18:00' if trigger.id == 'check_1' else '20:00' }})"
+              title: "⚠️ 窗户未关闭（{{ check_time_str }}）"
               message: |
                 检测到以下窗户未关闭：
-                - {{ open_details }}
-                {% if trigger.id == 'check_2' %}（对应窗帘已取消自动关闭）{% endif %}
-      # ================= 分支 2：所有窗户已闭合，且为第 2 次触发 =================
+                {% for line in open_details.split('\n') -%}
+                - {{ line }}
+                {% endfor %}
+                到 {{ second_check_time_str[:5] }} 仍未关闭，将取消本次自动关帘。
+      # ================= 分支 2：第 2 次检查，仍有窗户未关（加强提醒）=================
+      - conditions:
+          - condition: template
+            value_template: "{{ has_open and trigger.id == 'check_2' }}"
+        sequence:
+          - choose:
+              # 用户选择"已提醒过则跳过" → 静默
+              - conditions:
+                  - condition: template
+                    value_template: "{{ st_skip }}"
+                sequence: []
+              # 否则发送加强提醒：标题带 🚨，明确告知已取消自动关帘
+              - conditions: []
+                sequence:
+                  - action: !input notify_targets
+                    data:
+                      title: "🚨 窗户仍未关闭，自动关帘已取消（{{ check_time_str }}）"
+                      message: |
+                        以下窗户仍未关闭：
+                        {% for line in open_details.split('\n') -%}
+                        - {{ line }}
+                        {% endfor %}
+                        本次已取消窗帘自动关闭。
+                        请确认关窗后手动拉帘，或等待下次检查。
+            default: []
+      # ================= 分支 3：所有窗户已闭合，且为第 2 次触发 → 延时关帘 =================
       - conditions:
           - condition: template
             value_template: "{{ not has_open and trigger.id == 'check_2' }}"
