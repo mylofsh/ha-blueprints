@@ -57,15 +57,18 @@ blueprint:
       default: false
       selector:
         boolean:
-    notify_targets:
+    notify_service:
       name: 推送通知服务
-      description: 接收提醒的通知动作（例如 notify.mobile_app_iphone）
+      description: >
+        填写 notify 服务名，例如 notify.mobile_app_iphone。
+        可在「开发者工具 → 动作」中搜索 notify 查看到完整名称。
+      default: notify.notify
       selector:
-        action:
+        text:
     custom_title:
       name: 通知标题模板（可选）
       description: >-
-        留空使用默认标题。可用变量：{{ check_time }} {{ count }} {{ trigger }}
+        留空使用默认标题。可用变量：{{ check_time }} {{ count }} {{ trigger_label }}
       default: ""
       selector:
         template:
@@ -73,7 +76,7 @@ blueprint:
       name: 通知正文模板（可选）
       description: >-
         留空使用默认文案。可用变量：{{ check_time }} {{ count }} {{ windows }}
-        {{ next_check_time }} {{ trigger }}
+        {{ next_check_time }} {{ trigger_label }}
       default: ""
       selector:
         template:
@@ -93,6 +96,7 @@ variables:
   st_skip: !input skip_second_notify
   tpl_title: !input custom_title
   tpl_message: !input custom_message
+  svc: !input notify_service
 
   first_check_time_str: !input first_check_time
   second_check_time_str: !input second_check_time
@@ -138,7 +142,7 @@ action:
           - condition: template
             value_template: "{{ has_open and trigger.id == 'check_1' }}"
         sequence:
-          - action: !input notify_targets
+          - action: "{{ svc }}"
             data:
               title: >-
                 {%- if tpl_title | trim -%}
@@ -170,7 +174,7 @@ action:
               # 否则发送加强提醒
               - conditions: []
                 sequence:
-                  - action: !input notify_targets
+                  - action: "{{ svc }}"
                     data:
                       title: >-
                         {%- if tpl_title | trim -%}
@@ -199,7 +203,7 @@ action:
               seconds: !input delay_seconds
           - action: cover.close_cover
             target: !input covers_to_close
-          - action: !input notify_targets
+          - action: "{{ svc }}"
             data:
               title: 窗帘自动闭合
               message: "所有窗户已确认关闭，窗帘与纱帘已闭合 ✅"
